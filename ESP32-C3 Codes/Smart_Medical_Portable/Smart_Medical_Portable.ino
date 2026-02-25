@@ -1,18 +1,21 @@
 #include <Wire.h>
 #include "temp_sensor.h"
 #include "heart_sensor.h"
+#include "ble_manager.h"
 
-// 1. Declare the I2C Mutex
+// --- Serial Debug Flags ---
+bool MUTE_ALL_SERIAL = false; // Master switch: Set to 'true' to hide absolutely everything
+bool DEBUG_HEART     = true;  // Set to 'true' to print Heart Rate and SpO2
+bool DEBUG_TEMP      = true;  // Set to 'true' to print Temperature
+bool RAW_CSV_MODE    = false; // Set to 'true' to disable text and ONLY print "BPM,SpO2,Temp,Status"
+
 SemaphoreHandle_t i2cMutex;
 
-// 2. Cross-Task Communication Variables
-// "volatile" tells the compiler these might change at any time from a different core
-volatile long sharedIrValue = 0;
+// Cross-Task Communication Variables
 volatile int sharedBPM = 0;
-volatile int sharedAvgBPM = 0;
+volatile int sharedSpO2 = 0;
 volatile int sharedStatus = 0;
 
-// Task Function Prototypes
 void TaskHeartRate(void *pvParameters);
 void TaskTemperature(void *pvParameters);
 
@@ -28,68 +31,82 @@ void setup() {
   i2cMutex = xSemaphoreCreateMutex();
 
   if (i2cMutex != NULL) {
-    // Standard xTaskCreate for Single-Core ESP32-C3
-    xTaskCreate(
-      TaskHeartRate,    // Function to run
-      "HeartTask",      // Task name
-      4096,             // Stack size
-      NULL,             // Parameters
-      1,                // Priority (Lower)
-      NULL              // Task handle
-    );
-
-    xTaskCreate(
-      TaskTemperature,  
-      "TempTask",       
-      2048,             
-      NULL,             
-      2,                // Priority (Higher, ensures strict 200ms timing)
-      NULL              
-    );
+    // Increased stack size to 8192 for the SpO2 algorithm arrays
+    xTaskCreate(TaskHeartRate, "HeartTask", 8192, NULL, 1, NULL);
+    xTaskCreate(TaskTemperature, "TempTask", 2048, NULL, 2, NULL);
   } else {
     Serial.println("Error: Failed to create Mutex");
   }
+  initBLE();
 }
 
 void loop() {
-  // In an RTOS architecture, the main loop is left empty.
-  // The FreeRTOS scheduler takes over completely.
   vTaskDelay(portMAX_DELAY); 
 }
 
 // --- TASK DEFINITIONS ---
 
 void TaskHeartRate(void *pvParameters) {
+  bool firstFill = true;
+
   for (;;) {
-    // Wait up to max time to grab the I2C bus token
-    if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
-      
-      // We hold the token! Safe to talk to MAX30105
-      long irValue = updateHeartRate(); 
-      
-      // Done talking, give the token back immediately
-      xSemaphoreGive(i2cMutex);
+    int samplesNeeded = firstFill ? 100 : 25;
+    int startIndex = firstFill ? 0 : 75;
+    int samplesRead = 0;
+    int timeoutCounter = 0; // Added a timeout tracker
 
-      // Process the logic locally
-      int status = 0;
-      int currentBPM = 0;
-      int avgBPM = 0;
+    // Fill the buffer using Mutex Chunking
+    while (samplesRead < samplesNeeded) {
+      int read = 0;
+      if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
+        read = readFIFOChunks(startIndex + samplesRead, samplesNeeded - samplesRead);
+        xSemaphoreGive(i2cMutex);
+      }
+      
+      samplesRead += read;
 
-      if (irValue > 50000) {
-        status = 1;
-        currentBPM = (int)getBPM();
-        avgBPM = getAvgBPM();
+      // Hardware Failure Detection
+      if (read == 0) {
+        timeoutCounter++; 
+      } else {
+        timeoutCounter = 0; // Reset if we successfully read data
       }
 
-      // Update the global variables for the Temp task to read
-      sharedIrValue = irValue;
-      sharedBPM = currentBPM;
-      sharedAvgBPM = avgBPM;
-      sharedStatus = status;
+      // If we wait 1 full second (100 loops * 10ms) with NO data, the sensor is dead
+      if (timeoutCounter > 100) {
+        break; // Break out of the infinite while loop
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(10)); 
     }
-    
-    // Yield for 10ms to prevent the task from locking up Core 0
-    vTaskDelay(pdMS_TO_TICKS(10)); 
+
+    // Handle the Failure State
+    if (timeoutCounter > 100) {
+      // Sensor disconnected or failed! Force everything to 0.
+      sharedBPM = 0;
+      sharedSpO2 = 0;
+      sharedStatus = 0;
+      
+      firstFill = true; // Force it to try a full 100-sample reboot when it reconnects
+      vTaskDelay(pdMS_TO_TICKS(1000)); // Wait a second before polling the dead bus again
+      continue; // Skip the heavy SpO2 math and restart the for(;;) loop
+    }
+
+    // If we reach here, hardware is healthy. Run the SpO2 Math!
+    calculateSpO2();
+
+    if (validHeartRate == 1 && validSPO2 == 1 && irBuffer[50] > 50000) {
+      sharedBPM = heartRate;
+      sharedSpO2 = spo2;
+      sharedStatus = 1;
+    } else {
+      sharedBPM = 0;
+      sharedSpO2 = 0;
+      sharedStatus = 0; // Finger removed (but hardware is healthy)
+    }
+
+    shiftBufferDown();
+    firstFill = false;
   }
 }
 
@@ -97,31 +114,51 @@ void TaskTemperature(void *pvParameters) {
   for (;;) {
     float objectTemp = 0.0;
 
-    // Grab the I2C bus token to read the MLX90614
     if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
       objectTemp = readTemperature();
       xSemaphoreGive(i2cMutex);
     }
 
-    // --- Timed Printing (Strict Integer CSV Format) ---
-    // Serial printing does not require the I2C Mutex
-    Serial.print(sharedIrValue);
-    Serial.print(",");
-    Serial.print(sharedBPM);
-    Serial.print(",");
-    Serial.print(sharedAvgBPM);
-    Serial.print(",");
-    
+    // Hardware Failure Detection for MLX90614
     if (isnan(objectTemp)) {
-      Serial.print("0.00"); 
-    } else {
-      Serial.print(objectTemp);
+      objectTemp = 0.0; 
     }
-    
-    Serial.print(",");
-    Serial.println(sharedStatus); // Terminates the packet
 
-    // Block this task for EXACTLY 200ms. FreeRTOS guarantees this timing.
-    vTaskDelay(pdMS_TO_TICKS(100)); 
+    // --- Smart Serial Output Logic ---
+    if (!MUTE_ALL_SERIAL) {
+      
+      if (RAW_CSV_MODE) {
+        // App-Mode: Strict CSV format
+        Serial.print(sharedBPM); Serial.print(",");
+        Serial.print(sharedSpO2); Serial.print(",");
+        Serial.print(objectTemp); Serial.print(",");
+        Serial.println(sharedStatus);
+        
+      } else {
+        // Debug-Mode: Human readable text
+        if (DEBUG_HEART) {
+          Serial.print("BPM: "); Serial.print(sharedBPM);
+          Serial.print(" | SpO2: "); Serial.print(sharedSpO2);
+          Serial.print("% | Status: "); Serial.print(sharedStatus);
+        }
+        
+        if (DEBUG_HEART && DEBUG_TEMP) {
+          Serial.print("  ||  "); // Separator if both are printing
+        }
+        
+        if (DEBUG_TEMP) {
+          Serial.print("Temp: "); Serial.print(objectTemp); Serial.print("C");
+        }
+        
+        if (DEBUG_HEART || DEBUG_TEMP) {
+          Serial.println(); // End the line properly
+        }
+      }
+    }
+
+    // Send payload to the phone via BLE
+    sendBLEData(sharedBPM, objectTemp, sharedSpO2);
+
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
   }
 }
