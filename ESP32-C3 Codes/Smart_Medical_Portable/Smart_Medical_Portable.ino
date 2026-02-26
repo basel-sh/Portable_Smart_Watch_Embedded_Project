@@ -4,10 +4,10 @@
 #include "ble_manager.h"
 
 // --- Serial Debug Flags ---
-bool MUTE_ALL_SERIAL = false; // Master switch: Set to 'true' to hide absolutely everything
+bool MUTE_ALL_SERIAL = true; // Master switch: Set to 'true' to hide absolutely everything
 bool DEBUG_HEART     = true;  // Set to 'true' to print Heart Rate and SpO2
 bool DEBUG_TEMP      = true;  // Set to 'true' to print Temperature
-bool RAW_CSV_MODE    = false; // Set to 'true' to disable text and ONLY print "BPM,SpO2,Temp,Status"
+bool RAW_CSV_MODE    = true; // Set to 'true' to disable text and ONLY print "BPM,SpO2,Temp,Status"
 
 SemaphoreHandle_t i2cMutex;
 
