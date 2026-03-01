@@ -17,6 +17,12 @@ float smoothedBPM = 0.0;
 const float BPM_ALPHA = 0.3; 
 int finalDisplayBPM = 0; 
 
+// --- SpO2 Smoothing Global Variables ---
+float smoothedSpO2 = 0.0;
+// A very low alpha (0.1) because blood oxygen changes very slowly in reality
+const float SPO2_ALPHA = 0.1; 
+int finalDisplaySpO2 = 0;
+
 // Cross-Task Communication Variables
 volatile int sharedBPM = 0;
 volatile int sharedSpO2 = 0;
@@ -107,18 +113,36 @@ void TaskHeartRate(void *pvParameters) {
         finalDisplayBPM = (int)smoothedBPM; 
       }
     }
+
+    // 2. Silent SpO2 Smoothing Filter
+    if (validSPO2 == 1) {
+      // Sanity Check: Only accept reasonable human oxygen levels (70% - 100%)
+      if (spo2 > 70 && spo2 <= 100) {
+        if (smoothedSpO2 == 0.0) {
+          smoothedSpO2 = spo2; // Seed the filter instantly on first read
+        } else {
+          // Apply the heavy biological filter
+          smoothedSpO2 = (SPO2_ALPHA * spo2) + ((1.0 - SPO2_ALPHA) * smoothedSpO2);
+        }
+        finalDisplaySpO2 = (int)smoothedSpO2; 
+      }
+    }
     
-    // 2. Global Variable Assignment
+    // 3. Global Variable Assignment
     if (validHeartRate == 1 && validSPO2 == 1 && irBuffer[50] > 50000) {
-      sharedBPM = finalDisplayBPM; // FIXED: Now routing the smooth data to BLE/CSV!
-      sharedSpO2 = spo2;
+      sharedBPM = finalDisplayBPM; 
+      sharedSpO2 = finalDisplaySpO2; // <-- Now routing the rock-solid SpO2!
       sharedStatus = 1;
     } else {
       sharedBPM = 0;
       sharedSpO2 = 0;
       sharedStatus = 0; 
-      smoothedBPM = 0.0;     // FIXED: Erase filter history when finger is removed
+      
+      // Erase filter history when finger is removed so the next reading is fresh
+      smoothedBPM = 0.0;     
       finalDisplayBPM = 0;
+      smoothedSpO2 = 0.0;    
+      finalDisplaySpO2 = 0;  
     }
 
     shiftBufferDown();
