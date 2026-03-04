@@ -9,21 +9,25 @@
 static BLECharacteristic *pCharacteristic;
 static bool deviceConnected = false;
 
-class MyServerCallbacks : public BLEServerCallbacks {
+class MyServerCallbacks : public BLEServerCallbacks
+{
 
-  void onConnect(BLEServer* pServer) {
+  void onConnect(BLEServer *pServer)
+  {
     deviceConnected = true;
     Serial.println("PHONE CONNECTED");
   }
 
-  void onDisconnect(BLEServer* pServer) {
-  deviceConnected = false;
-  Serial.println("PHONE DISCONNECTED");
-  BLEDevice::startAdvertising();
+  void onDisconnect(BLEServer *pServer)
+  {
+    deviceConnected = false;
+    Serial.println("PHONE DISCONNECTED");
+    BLEDevice::startAdvertising();
   }
 };
 
-void initBLE() {
+void initBLE()
+{
 
   BLEDevice::init("ESP32_VITAL");
 
@@ -34,10 +38,10 @@ void initBLE() {
       pServer->createService("12345678-1234-1234-1234-1234567890ab");
 
   pCharacteristic =
-    pService->createCharacteristic(
-        "abcd1234-1234-1234-1234-1234567890ab",
-        BLECharacteristic::PROPERTY_NOTIFY |
-        BLECharacteristic::PROPERTY_READ);
+      pService->createCharacteristic(
+          "abcd1234-1234-1234-1234-1234567890ab",
+          BLECharacteristic::PROPERTY_NOTIFY |
+              BLECharacteristic::PROPERTY_READ);
 
   pCharacteristic->addDescriptor(new BLE2902());
 
@@ -47,12 +51,14 @@ void initBLE() {
   Serial.println("BLE READY");
 }
 
-void sendBLEData(int bpm, float temp, int spo2) {
-  if (!deviceConnected) return;
+void sendBLEData(int bpm, float temp, int spo2)
+{
+  if (!deviceConnected)
+    return;
 
   // Create a character array to hold the formatted data
-  char bleData[32]; 
-  
+  char bleData[32];
+
   // Format the data into the array (e.g., "75,36.5,98")
   snprintf(bleData, sizeof(bleData), "%d,%.1f,%d", bpm, temp, spo2);
 
