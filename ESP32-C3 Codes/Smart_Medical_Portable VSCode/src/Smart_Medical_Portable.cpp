@@ -48,7 +48,7 @@ void setup() {
   if (i2cMutex != NULL) {
     xTaskCreate(TaskFallDetection, "FallTask", 2048, NULL, 3, NULL);
     xTaskCreate(TaskHeartRate, "HeartTask", 8192, NULL, 1, NULL);
-    xTaskCreate(TaskTemperature, "TempTask", 2048, NULL, 2, NULL);
+    xTaskCreate(TaskTemperature, "TempTask", 8192, NULL, 2, NULL);
   } else {
     Serial.println("Error: Failed to create Mutex");
   }
