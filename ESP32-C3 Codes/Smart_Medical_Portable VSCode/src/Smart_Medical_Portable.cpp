@@ -4,6 +4,7 @@
 #include "heart_sensor.h"
 #include "ble_manager.h"
 #include "mpu.h"
+#include "BME680.h"
 
 // --- Serial Debug Flags ---
 bool MUTE_ALL_SERIAL = false; 
@@ -32,6 +33,7 @@ volatile int sharedStatus = 0;
 void TaskHeartRate(void *pvParameters);
 void TaskTemperature(void *pvParameters);
 void TaskFallDetection(void *pvParameters);
+void TaskEnvironment(void *pvParameters);
 
 void setup() {
   Serial.begin(115200);
@@ -42,13 +44,15 @@ void setup() {
   initTempSensor();
   initHeartSensor();
   initMPU();
+  initBME680();
 
   i2cMutex = xSemaphoreCreateMutex();
 
   if (i2cMutex != NULL) {
     xTaskCreate(TaskFallDetection, "FallTask", 2048, NULL, 3, NULL);
     xTaskCreate(TaskHeartRate, "HeartTask", 8192, NULL, 1, NULL);
-    xTaskCreate(TaskTemperature, "TempTask", 8192, NULL, 2, NULL);
+    xTaskCreate(TaskTemperature, "TempTask", 2048, NULL, 2, NULL);
+    xTaskCreate(TaskEnvironment, "EnvTask", 8192, NULL, 1, NULL); 
   } else {
     Serial.println("Error: Failed to create Mutex");
   }
@@ -167,34 +171,35 @@ void TaskTemperature(void *pvParameters) {
       objectTemp = 0.0; 
     }
 
+   // --- TELEMETRY PRINTING ---
     if (!MUTE_ALL_SERIAL) {
       if (RAW_CSV_MODE) {
         Serial.print(sharedBPM); Serial.print(",");
         Serial.print(sharedSpO2); Serial.print(",");
         Serial.print(objectTemp); Serial.print(",");
-        Serial.println(sharedStatus);
+        Serial.print(sharedStatus); Serial.print(",");
+        Serial.println(sharedIAQ); // Adding IAQ to CSV
       } else {
         if (DEBUG_HEART) {
-          // Both finalDisplayBPM and sharedBPM are now identical, so either works here
           Serial.print("BPM: "); Serial.print(sharedBPM);
           Serial.print(" | SpO2: "); Serial.print(sharedSpO2);
           Serial.print("% | Status: "); Serial.print(sharedStatus);
         }
-        
-        if (DEBUG_HEART && DEBUG_TEMP) {
-          Serial.print("  ||  "); 
-        }
+        if (DEBUG_HEART && DEBUG_TEMP) Serial.print("  ||  "); 
         
         if (DEBUG_TEMP) {
-          Serial.print("Temp: "); Serial.print(objectTemp); Serial.print("C");
+          Serial.print("Skin Temp: "); Serial.print(objectTemp); Serial.print("C");
         }
         
-        if (DEBUG_HEART || DEBUG_TEMP) {
-          Serial.println(); 
-        }
+        // --- NEW: Print BME680 Data ---
+        Serial.print("  ||  Env Temp: "); Serial.print(sharedTemp); Serial.print("C");
+        Serial.print(" | IAQ: "); Serial.print(sharedIAQ); 
+        Serial.print(" | Alt: "); Serial.print(sharedAltitude); Serial.print("m");
+        
+        Serial.println(); 
       }
     }
-
+    
     // FIXED: Added sharedStatus as the 4th argument to match ble_manager.h
     sendBLEData(sharedBPM, objectTemp, sharedSpO2);
 
@@ -210,5 +215,16 @@ void TaskFallDetection(void *pvParameters) {
     
     // Run every 40ms (~25Hz) just like your Arduino test script
     vTaskDelay(pdMS_TO_TICKS(40)); 
+  }
+}
+
+void TaskEnvironment(void *pvParameters) {
+  for (;;) {
+    // Triggers the BSEC2 state machine. Uses SPI, so no Mutex needed!
+    processBME680(); 
+    
+    // Yield the CPU. BSEC2 only outputs new data every 3 seconds, 
+    // but polling it every 50ms ensures the DSP timing loop stays perfectly aligned.
+    vTaskDelay(pdMS_TO_TICKS(50)); 
   }
 }
