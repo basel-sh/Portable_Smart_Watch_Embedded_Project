@@ -3,72 +3,124 @@
 
 #include <Wire.h>
 #include "MAX30105.h"
-#include "spo2_algorithm.h" // Swapped to the clinical SpO2 library
+#include "mpu.h" // Access currentAccMag
 
 MAX30105 particleSensor;
 
-// The Maxim algorithm requires exactly 100 samples
-#define SPO2_BUFFER_SIZE 100
-uint32_t irBuffer[SPO2_BUFFER_SIZE];
-uint32_t redBuffer[SPO2_BUFFER_SIZE];
+volatile int heartRate = 0;
+volatile int spo2 = 0;
+volatile int validHeartRate = 0;
+volatile int validSPO2 = 0;
 
-// Algorithm Output Variables
-int32_t spo2;
-int8_t validSPO2;
-int32_t heartRate;
-int8_t validHeartRate;
+// DSP BPM Variables
+unsigned long lastBeat = 0;
+float prevInput = 0, prevOutput = 0, prevValue = 0, prevDerivative = 0;
+unsigned long lastPeakTime = 0;
+const float HP_ALPHA = 0.90f; 
+const int BLANKING_WINDOW = 350; 
+
+// ANC Tuning
+const float ANC_BETA = 450.0f; // Tuning constant: Motion Magnitude -> PPG Noise
+
+// SpO2 Variables
+float dcRed = 0.0, dcIR = 0.0;
+const float DC_ALPHA = 0.95f;
+float acSqSumRed = 0.0, acSqSumIR = 0.0;
+int sampleCount = 0;
+const int SPO2_WINDOW = 100;
+
+float highPassFilter(float input) {
+    float output = HP_ALPHA * (prevOutput + input - prevInput);
+    prevInput = input; prevOutput = output;
+    return output;
+}
+
+float smoothSignal(float input) {
+    static float buffer[5];
+    static int index = 0;
+    buffer[index] = input;
+    index = (index + 1) % 5;
+    float sum = 0;
+    for(int i=0; i<5; i++) sum += buffer[i];
+    return sum / 5.0f;
+}
+
+bool detectBeat(float signal) {
+    float derivative = signal - prevValue;
+    bool peakDetected = false;
+    if(prevDerivative > 0 && derivative < 0 && signal > 35.0f) {
+        unsigned long now = millis();
+        if(now - lastPeakTime > BLANKING_WINDOW) {
+            peakDetected = true;
+            lastPeakTime = now;
+        }
+    }
+    prevDerivative = derivative;
+    prevValue = signal;
+    return peakDetected;
+}
 
 bool initHeartSensor() {
-  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    Serial.println("MAX30102 not found");
-    return false;
-  }
-
-  // Critical SpO2 Configuration:
-  // LED Power: 0x3F (~12.8mA - Good for penetrating tissue)
-  // Sample Average: 4
-  // LED Mode: 2 (Red + IR)
-  // Sample Rate: 100 (100Hz / 4 avg = 25Hz effective output)
-  // Pulse Width: 411 (18-bit resolution)
-  // ADC Range: 4096
-  particleSensor.setup(0x3F, 4, 2, 100, 411, 4096); 
-  
-  return true;
+    if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) return false;
+    particleSensor.setup(0x24, 4, 2, 100, 411, 4096);
+    return true;
 }
 
-// RTOS-Safe Chunk Reader: Grabs whatever is in the FIFO right now
-int readFIFOChunks(int startIndex, int maxSamplesToRead) {
-  particleSensor.check(); // Tell sensor to ready its data
-  int available = particleSensor.available();
-  int samplesRead = 0;
+void processHeartData(SemaphoreHandle_t mutex, float currentAccMag){
+    if (xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
+        particleSensor.check();
+        xSemaphoreGive(mutex);
+    }
+    while (particleSensor.available()) {
+        uint32_t irValue = particleSensor.getFIFOIR();
+        uint32_t redValue = particleSensor.getFIFORed();
+        particleSensor.nextSample();
 
-  while (available > 0 && samplesRead < maxSamplesToRead) {
-    redBuffer[startIndex + samplesRead] = particleSensor.getFIFORed();
-    irBuffer[startIndex + samplesRead] = particleSensor.getFIFOIR();
-    particleSensor.nextSample(); // Clear the space in the sensor's memory
-    
-    available--;
-    samplesRead++;
-  }
-  return samplesRead;
+        if(irValue < 30000) { 
+            validHeartRate = 0; validSPO2 = 0; heartRate = 0; spo2 = 0;
+            dcRed = 0; dcIR = 0; acSqSumRed = 0; acSqSumIR = 0;
+            sampleCount = 0; lastBeat = millis();
+            prevInput = 0; prevOutput = 0;
+            continue;
+        }
+
+        // --- APPLY ANC MODIFICATION ---
+        float motionNoise = abs(currentAccMag - 1.0f);
+        float hpSignal = highPassFilter((float)irValue);
+        
+        // Subtract estimated motion noise from the AC signal
+        float cleanSignal = hpSignal - (motionNoise * ANC_BETA);
+        
+        float filtered = smoothSignal(cleanSignal);
+        
+        if(detectBeat(filtered)) {
+            long delta = millis() - lastBeat;
+            lastBeat = millis();
+            float rawBpm = 60000.0f / (float)delta;
+            
+            if(rawBpm > 45 && rawBpm < 160) {
+                heartRate = (heartRate == 0) ? (int)rawBpm : (int)(0.2f * rawBpm + 0.8f * heartRate);
+                validHeartRate = 1;
+            }
+        }
+
+        if(dcRed == 0) { dcRed = redValue; dcIR = irValue; }
+        dcRed = (DC_ALPHA * dcRed) + ((1.0f - DC_ALPHA) * redValue);
+        dcIR = (DC_ALPHA * dcIR) + ((1.0f - DC_ALPHA) * irValue);
+        float acRed = (float)redValue - dcRed;
+        float acIR = (float)irValue - dcIR;
+        acSqSumRed += acRed * acRed;
+        acSqSumIR += acIR * acIR;
+        sampleCount++;
+
+        if(sampleCount >= SPO2_WINDOW) {
+            float rmsRed = sqrt(acSqSumRed / SPO2_WINDOW);
+            float rmsIR = sqrt(acSqSumIR / SPO2_WINDOW);
+            float ratio = (rmsRed / dcRed) / (rmsIR / dcIR);
+            float calc = 104.0f - (17.0f * ratio);
+            if(calc > 85 && calc <= 100) { spo2 = (int)calc; validSPO2 = 1; }
+            acSqSumRed = 0; acSqSumIR = 0; sampleCount = 0;
+        }
+    }
 }
-
-// Wrapper to trigger the heavy DSP math
-void calculateSpO2() {
-  maxim_heart_rate_and_oxygen_saturation(
-    irBuffer, SPO2_BUFFER_SIZE, 
-    redBuffer, 
-    &spo2, &validSPO2, 
-    &heartRate, &validHeartRate
-  );
-}
-
-// The Sliding Window: Shift the newest 75 samples down to make room for 25 new ones
-void shiftBufferDown() {
-  for (byte i = 25; i < SPO2_BUFFER_SIZE; i++) {
-    redBuffer[i - 25] = redBuffer[i];
-    irBuffer[i - 25] = irBuffer[i];
-  }
-}
-
 #endif

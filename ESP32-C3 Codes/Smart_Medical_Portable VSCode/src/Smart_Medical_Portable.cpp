@@ -6,6 +6,11 @@
 #include "mpu.h"
 #include "BME680.h"
 
+
+#define altitudediff -0.55f
+#define fallValidationStart 2000
+#define BUZZER_PIN 10
+
 // --- Serial Debug Flags ---
 bool MUTE_ALL_SERIAL = false; 
 bool DEBUG_HEART     = true;  
@@ -46,6 +51,10 @@ void setup() {
   initMPU();
   initBME680();
 
+  // --- Initialize Buzzer ---
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // Ensure it starts off
+
   i2cMutex = xSemaphoreCreateMutex();
 
   if (i2cMutex != NULL) {
@@ -66,95 +75,18 @@ void loop() {
 // --- TASK DEFINITIONS ---
 
 void TaskHeartRate(void *pvParameters) {
-  bool firstFill = true;
-
   for (;;) {
-    int samplesNeeded = firstFill ? 100 : 25;
-    int startIndex = firstFill ? 0 : 75;
-    int samplesRead = 0;
-    int timeoutCounter = 0; 
+    // Pass the current acceleration magnitude into the ANC filter
+    processHeartData(i2cMutex, currentAccMag); 
 
-    while (samplesRead < samplesNeeded) {
-      int read = 0;
-      if (xSemaphoreTake(i2cMutex, portMAX_DELAY) == pdTRUE) {
-        read = readFIFOChunks(startIndex + samplesRead, samplesNeeded - samplesRead);
-        xSemaphoreGive(i2cMutex);
-      }
-      
-      samplesRead += read;
-
-      if (read == 0) {
-        timeoutCounter++; 
-      } else {
-        timeoutCounter = 0; 
-      }
-
-      if (timeoutCounter > 100) {
-        break; 
-      }
-
-      vTaskDelay(pdMS_TO_TICKS(10)); 
-    }
-
-    if (timeoutCounter > 100) {
-      sharedBPM = 0;
-      sharedSpO2 = 0;
-      sharedStatus = 0;
-      smoothedBPM = 0.0; // Reset filter memory on hardware crash
-      
-      firstFill = true; 
-      vTaskDelay(pdMS_TO_TICKS(1000)); 
-      continue; 
-    }
-
-    // Run the SpO2 Math
-    calculateSpO2();
-    
-    // 1. Silent BPM Smoothing Filter
-    if (validHeartRate == 1) { 
-      if (heartRate > 40 && heartRate < 160) {
-        if (smoothedBPM == 0.0) {
-          smoothedBPM = heartRate; 
-        } else {
-          smoothedBPM = (BPM_ALPHA * heartRate) + ((1.0 - BPM_ALPHA) * smoothedBPM);
-        }
-        finalDisplayBPM = (int)smoothedBPM; 
-      }
-    }
-
-    // 2. Silent SpO2 Smoothing Filter
-    if (validSPO2 == 1) {
-      // Sanity Check: Only accept reasonable human oxygen levels (70% - 100%)
-      if (spo2 > 70 && spo2 <= 100) {
-        if (smoothedSpO2 == 0.0) {
-          smoothedSpO2 = spo2; // Seed the filter instantly on first read
-        } else {
-          // Apply the heavy biological filter
-          smoothedSpO2 = (SPO2_ALPHA * spo2) + ((1.0 - SPO2_ALPHA) * smoothedSpO2);
-        }
-        finalDisplaySpO2 = (int)smoothedSpO2; 
-      }
-    }
-    
-    // 3. Global Variable Assignment
-    if (validHeartRate == 1 && validSPO2 == 1 && irBuffer[50] > 50000) {
-      sharedBPM = finalDisplayBPM; 
-      sharedSpO2 = finalDisplaySpO2; // <-- Now routing the rock-solid SpO2!
-      sharedStatus = 1;
+    if (validHeartRate || validSPO2) {
+      sharedBPM = heartRate; 
+      sharedSpO2 = spo2;
+      sharedStatus = (isUserMoving) ? 2 : 1; // 2 still means 'motion detected' but we are still calculating
     } else {
-      sharedBPM = 0;
-      sharedSpO2 = 0;
-      sharedStatus = 0; 
-      
-      // Erase filter history when finger is removed so the next reading is fresh
-      smoothedBPM = 0.0;     
-      finalDisplayBPM = 0;
-      smoothedSpO2 = 0.0;    
-      finalDisplaySpO2 = 0;  
+      sharedBPM = 0; sharedSpO2 = 0; sharedStatus = 0; 
     }
-
-    shiftBufferDown();
-    firstFill = false;
+    vTaskDelay(pdMS_TO_TICKS(20)); 
   }
 }
 
@@ -171,49 +103,83 @@ void TaskTemperature(void *pvParameters) {
       objectTemp = 0.0; 
     }
 
-   // --- TELEMETRY PRINTING ---
+    // --- UPDATED TELEMETRY PRINTING ---
     if (!MUTE_ALL_SERIAL) {
       if (RAW_CSV_MODE) {
-        Serial.print(sharedBPM); Serial.print(",");
-        Serial.print(sharedSpO2); Serial.print(",");
-        Serial.print(objectTemp); Serial.print(",");
-        Serial.print(sharedStatus); Serial.print(",");
-        Serial.println(sharedIAQ); // Adding IAQ to CSV
+        // CSV Format: BPM, SpO2, SkinTemp, Status, IAQ, Humidity, Gas
+        Serial.printf("%d,%d,%.2f,%d,%.2f,%.2f,%.2f\n", 
+                      sharedBPM, sharedSpO2, objectTemp, sharedStatus, 
+                      sharedIAQ, sharedHumidity, sharedGas);
       } else {
         if (DEBUG_HEART) {
-          Serial.print("BPM: "); Serial.print(sharedBPM);
-          Serial.print(" | SpO2: "); Serial.print(sharedSpO2);
-          Serial.print("% | Status: "); Serial.print(sharedStatus);
+          Serial.printf("BPM: %d | SpO2: %d%% | Status: %d", 
+                        sharedBPM, sharedSpO2, sharedStatus);
         }
+        
         if (DEBUG_HEART && DEBUG_TEMP) Serial.print("  ||  "); 
         
         if (DEBUG_TEMP) {
-          Serial.print("Skin Temp: "); Serial.print(objectTemp); Serial.print("C");
+          Serial.printf("Skin Temp: %.2fC", objectTemp);
         }
         
-        // --- NEW: Print BME680 Data ---
-        Serial.print("  ||  Env Temp: "); Serial.print(sharedTemp); Serial.print("C");
-        Serial.print(" | IAQ: "); Serial.print(sharedIAQ); 
-        Serial.print(" | Alt: "); Serial.print(sharedAltitude); Serial.print("m");
-        
-        Serial.println(); 
+        // --- NEW: Humidity and Gas/IAQ display ---
+        Serial.printf("  ||  Hum: %.1f%% | IAQ: %.1f\n", 
+                      sharedHumidity, sharedIAQ);
       }
     }
     
-    // FIXED: Added sharedStatus as the 4th argument to match ble_manager.h
+    // Broadcast to BLE (Passing 4 arguments)
     sendBLEData(sharedBPM, objectTemp, sharedSpO2);
 
     vTaskDelay(pdMS_TO_TICKS(1000)); 
   }
-  
 }
-// 5. Add the Fall Detection Task at the bottom
+
+// --- Add these variables above your task ---
+unsigned long fallValidationStartTime = 0; // Renamed to avoid mpu.h collision
+bool pendingFallValidation = false;
+
 void TaskFallDetection(void *pvParameters) {
   for (;;) {
-    // Pass the mutex to safely read I2C
-    processFallDetection(i2cMutex); 
+    // 1. Check for instantaneous physical impact (Now returning a bool!)
+    bool mpuDetectedImpact = processFallDetection(i2cMutex); 
+
+    // 2. If we feel an impact, open the validation window
+    if (mpuDetectedImpact && !pendingFallValidation) {
+        fallValidationStartTime = millis();
+        pendingFallValidation = true;
+        Serial.println("MPU Impact Detected! Waiting for Barometric validation...");
+    }
+
+    // 3. The Validation Window (Check for the next 1000ms after impact)
+    if (pendingFallValidation) {
+        
+        // Did the altitude drop confirm it?
+       if (sharedAltitudeDrop < altitudediff) {
+            Serial.println("=========================================");
+            Serial.println("!!! CRITICAL FALL CONFIRMED !!!");
+            Serial.print("Altitude Drop: ");
+            Serial.print(sharedAltitudeDrop);
+            Serial.println(" meters");
+            Serial.println("=========================================");
+            
+            // --- Activate the Buzzer ---
+            digitalWrite(BUZZER_PIN, HIGH);
+            vTaskDelay(pdMS_TO_TICKS(2000)); // Ring for 2 seconds
+            digitalWrite(BUZZER_PIN, LOW);
+            
+            // --- TODO: Trigger BLE Emergency Alert Here ---
+            
+            pendingFallValidation = false; // Reset state machine
+        }
+        
+        // Timeout: If 1 second passes and the altitude never dropped
+        else if (millis() - fallValidationStartTime > fallValidationStart) {
+            Serial.println("False Alarm Rejected: Impact felt, but no altitude drop.");
+            pendingFallValidation = false; // Reset state machine
+        }
+    }
     
-    // Run every 40ms (~25Hz) just like your Arduino test script
     vTaskDelay(pdMS_TO_TICKS(40)); 
   }
 }
