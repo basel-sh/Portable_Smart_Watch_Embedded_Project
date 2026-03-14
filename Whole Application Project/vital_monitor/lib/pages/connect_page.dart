@@ -1,51 +1,37 @@
 import 'package:flutter/material.dart';
 import '../bluetooth/ble_service.dart';
 import 'home_page.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 class ConnectPage extends StatefulWidget {
+  const ConnectPage({super.key});
+
   @override
   State<ConnectPage> createState() => _ConnectPageState();
 }
 
 class _ConnectPageState extends State<ConnectPage> {
-
   final ble = BleService();
-  
-Future requestPermissions() async {
-  await Permission.location.request();
-  await Permission.bluetoothScan.request();
-  await Permission.bluetoothConnect.request();
-}
 
+  @override
+  void initState() {
+    super.initState();
 
-@override
-void initState() {
-  super.initState();
-
-  requestPermissions().then((_) {
-
-    ble.startScan((device) async {
-
-      await ble.connect(device);
+    Future.delayed(const Duration(seconds: 1), () {
+      if (!mounted) return;
 
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(
-          builder: (_) => HomePage(ble: ble),
-        ),
+        MaterialPageRoute(builder: (_) => HomePage(ble: ble)),
       );
-
     });
-
-  });
-}
-
+  }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(child: Text("Scanning ESP32...")),
+    return const Scaffold(
+      body: Center(
+        child: Text("Opening Dashboard...", style: TextStyle(fontSize: 22)),
+      ),
     );
   }
 }

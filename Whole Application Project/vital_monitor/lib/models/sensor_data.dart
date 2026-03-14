@@ -1,23 +1,50 @@
 class SensorData {
-  final int hr;
-  final double temp;
-  final int spo2;
+
+  final double bpm;
+  final double spo2;
+  final double bodyTemp;
+  final double airTemp;
+  final double humidity;
+  final double voc;
+
+  final bool fallDetected;
+  final bool heartAttack;
+  final bool airPolluted;
+  final bool handRemoved;
+
   final int time;
 
   SensorData({
-    required this.hr,
-    required this.temp,
+    required this.bpm,
     required this.spo2,
+    required this.bodyTemp,
+    required this.airTemp,
+    required this.humidity,
+    required this.voc,
+    required this.fallDetected,
+    required this.heartAttack,
+    required this.airPolluted,
+    required this.handRemoved,
     required this.time,
   });
 
-  factory SensorData.fromBle(String data) {
-    final parts = data.split(',');
+  factory SensorData.fromBle(String raw) {
+
+    final p = raw.split(',');
 
     return SensorData(
-      hr: int.parse(parts[0]),
-      temp: double.parse(parts[1]),
-      spo2: int.parse(parts[2]),
+      bpm: double.parse(p[0]),
+      spo2: double.parse(p[1]),
+      bodyTemp: double.parse(p[2]),
+      airTemp: double.parse(p[3]),
+      humidity: double.parse(p[4]),
+      voc: double.parse(p[5]),
+
+      fallDetected: p[6] == "1",
+      heartAttack: p[7] == "1",
+      airPolluted: p[8] == "1",
+      handRemoved: p[9] == "1",
+
       time: DateTime.now().millisecondsSinceEpoch,
     );
   }

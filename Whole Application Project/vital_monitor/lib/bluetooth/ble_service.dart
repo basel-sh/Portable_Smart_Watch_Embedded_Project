@@ -1,62 +1,39 @@
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'dart:async';
+import 'dart:math';
 import '../models/sensor_data.dart';
 
 class BleService {
-
-  BluetoothDevice? device;
-  BluetoothCharacteristic? characteristic;
-
   Stream<SensorData>? dataStream;
 
-Future startScan(Function(BluetoothDevice) onFound) async {
+  void startFakeStream() {
+    final r = Random();
 
-  print("STARTING SCAN...");
+    dataStream = Stream.periodic(const Duration(seconds: 1), (_) {
+      double bpm = 60 + r.nextInt(40).toDouble();
+      double spo2 = 95 + r.nextInt(4).toDouble();
+      double bodyTemp = 36 + r.nextDouble();
+      double airTemp = 20 + r.nextDouble() * 10;
+      double humidity = 40 + r.nextDouble() * 40;
+      double voc = r.nextDouble() * 500;
 
-  await FlutterBluePlus.startScan();
+      bool fall = r.nextInt(100) > 70;
+      bool heartAttack = bpm > 100;
+      bool polluted = voc > 300;
+      bool handRemoved = r.nextInt(100) > 80;
 
-  FlutterBluePlus.scanResults.listen((results) {
-
-    for (var r in results) {
-
-      print("FOUND: ${r.advertisementData.advName}");
-
-      if (r.advertisementData.advName == "ESP32_VITAL") {
-
-        print("ESP FOUND !!!");
-
-        FlutterBluePlus.stopScan();
-
-        onFound(r.device);
-        return;
-      }
-    }
-  });
-}
-
-
-  Future connect(BluetoothDevice d) async {
-
-    device = d;
-    await d.connect(autoConnect: false);
-
-
-    var services = await d.discoverServices();
-
-    for (var s in services) {
-      if (s.uuid.toString() ==
-          "12345678-1234-1234-1234-1234567890ab") {
-
-        characteristic = s.characteristics.first;
-        await characteristic!.setNotifyValue(true);
-
-        dataStream =
-            characteristic!.onValueReceived.map((event) {
-
-          String raw = String.fromCharCodes(event);
-
-          return SensorData.fromBle(raw);
-        });
-      }
-    }
+      return SensorData(
+        bpm: bpm,
+        spo2: spo2,
+        bodyTemp: bodyTemp,
+        airTemp: airTemp,
+        humidity: humidity,
+        voc: voc,
+        fallDetected: fall,
+        heartAttack: heartAttack,
+        airPolluted: polluted,
+        handRemoved: handRemoved,
+        time: DateTime.now().millisecondsSinceEpoch,
+      );
+    }).asBroadcastStream(); // ← important fix
   }
 }
